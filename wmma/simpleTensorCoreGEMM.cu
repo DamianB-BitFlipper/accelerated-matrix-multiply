@@ -1,6 +1,8 @@
 #include <iostream>
 #include <iomanip>
 #include <cstdint>
+#include <memory>
+#include <algorithm>
 
 #include <curand.h>
 #include <cublas_v2.h>
@@ -84,7 +86,37 @@ __global__ void convertFp32ToFp16(float* in, half* out, const int32_t len) {
     }
 }
 
+void referenceMatrixMultiply(
+    float* a,
+    float* b,
+    float* bias,
+    float* c_out,
+    int32_t M,
+    int32_t N,
+    int32_t K,
+    float alpha,
+    float beta) {
+    // Note: All input/output matrices are in column-major memory order
+    for (int32_t aRow{ 0 }; aRow < M; aRow++) {
+        for (int32_t bCol{ 0 }; bCol < N; bCol++) {
+            // Compute the value at `aRow, bCol`
+            for (int32_t k{ 0 }; k < K; k++) {
+                c_out[aRow + bCol * M] += a[aRow + k * M] * b[k + bCol * K];
+            }
+
+            // Scale the `a * b` result by `alpha`
+            c_out[aRow + bCol * M] *= alpha;
+
+            // Add in the `bias` scaled by `beta`
+            c_out[aRow + bCol * M] += beta * bias[aRow + bCol * M];
+        }
+    }
+}
+
 int32_t main() {
+    const float alpha{ 2.0f };
+    const float beta{ 2.0f };
+
     float* a_fp32;
     float* b_fp32;
     float* bias_fp32;
@@ -94,8 +126,14 @@ int32_t main() {
     half* bias_fp16;
     half* c_fp16;
 
-    const float alpha{ 2.0f };
-    const float beta{ 2.0f };
+    // Allocate the memory for the matrices
+    cudaMalloc(&a_fp32, MATRIX_M * MATRIX_K * sizeof(float));
+    cudaMalloc(&b_fp32, MATRIX_K * MATRIX_N * sizeof(float));
+    cudaMalloc(&bias_fp32, MATRIX_M * MATRIX_N * sizeof(float));
+    cudaMalloc(&a_fp16, MATRIX_M * MATRIX_K * sizeof(half));
+    cudaMalloc(&b_fp16, MATRIX_K * MATRIX_N * sizeof(half));
+    cudaMalloc(&bias_fp16, MATRIX_M * MATRIX_N * sizeof(half));
+    cudaMalloc(&c_fp16, MATRIX_M * MATRIX_N * sizeof(half));
 
     // Create and initialize the CUDA random number generator
     curandGenerator_t randGen;
@@ -107,23 +145,20 @@ int32_t main() {
     cudaEventCreate(&startWMMA);
     cudaEventCreate(&stopWMMA);
 
-    // Allocate the memory for the matrices
-    cudaMalloc(&a_fp32, MATRIX_M * MATRIX_K * sizeof(float));
-    cudaMalloc(&b_fp32, MATRIX_K * MATRIX_N * sizeof(float));
-    cudaMalloc(&bias_fp32, MATRIX_M * MATRIX_N * sizeof(float));
-    cudaMalloc(&a_fp16, MATRIX_M * MATRIX_K * sizeof(half));
-    cudaMalloc(&b_fp16, MATRIX_K * MATRIX_N * sizeof(half));
-    cudaMalloc(&bias_fp16, MATRIX_M * MATRIX_N * sizeof(half));
-    cudaMalloc(&c_fp16, MATRIX_M * MATRIX_N * sizeof(half));
+    std::unique_ptr<float[]> a_host{ new float[MATRIX_M * MATRIX_K * sizeof(float)] };
+    std::unique_ptr<float[]> b_host{ new float[MATRIX_K * MATRIX_N * sizeof(float)] };
+    std::unique_ptr<float[]> bias_host{ new float[MATRIX_M * MATRIX_N * sizeof(float)] };
+    std::unique_ptr<float[]> c_host{ new float[MATRIX_M * MATRIX_N * sizeof(float)] };
 
-    // Clear the contents of `c_fp16`
+    // Clear the contents of `c` matrices
     cudaMemset(c_fp16, __float2half(0.0f), MATRIX_M * MATRIX_N * sizeof(half));
+    std::fill(c_host.get(), c_host.get() + MATRIX_M * MATRIX_N, 0.0f);
 
     // Curand does not support `half`, so generate random `float` and then convert to `half`
     {
         curandGenerateUniform(randGen, a_fp32, MATRIX_M * MATRIX_K);
         curandGenerateUniform(randGen, b_fp32, MATRIX_K * MATRIX_N);
-        curandGenerateUniform(randGen, bias_fp32, MATRIX_K * MATRIX_N);
+        curandGenerateUniform(randGen, bias_fp32, MATRIX_M * MATRIX_N);
 
         const int32_t BLOCK_SIZE{ 256 };
         dim3 gridDimA{ (MATRIX_M * MATRIX_K + BLOCK_SIZE - 1) / BLOCK_SIZE, 1, 1 };
@@ -154,6 +189,14 @@ int32_t main() {
         cudaStreamDestroy(stream2);
         cudaStreamDestroy(stream3);
     }
+
+    // Copy the random constents of the device float matrices to the host matrices
+    cudaMemcpy(
+        a_host.get(), a_fp32, MATRIX_M * MATRIX_K * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(
+        b_host.get(), b_fp32, MATRIX_K * MATRIX_N * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(
+        bias_host.get(), bias_fp32, MATRIX_M * MATRIX_N * sizeof(float), cudaMemcpyDeviceToHost);
 
     // Some useful prints
     std::cout << "M = " << MATRIX_M << ", ";
