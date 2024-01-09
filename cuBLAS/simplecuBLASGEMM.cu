@@ -7,11 +7,6 @@
 
 #include <curand.h>
 #include <cublas_v2.h>
-#include <mma.h>
-
-using namespace nvcuda;
-
-const int32_t WARP_SIZE{ 32 };
 
 const float ALPHA{ 2.0f };
 const float BETA{ 30.0f };
@@ -20,68 +15,6 @@ const float BETA{ 30.0f };
 const int32_t MATRIX_M{ 1024 };
 const int32_t MATRIX_N{ 1024 };
 const int32_t MATRIX_K{ 1024 };
-
-// The only dimensions currently supported by WMMA
-const int32_t WMMA_M{ 16 };
-const int32_t WMMA_N{ 16 };
-const int32_t WMMA_K{ 16 };
-
-__global__ void wmma_matmul(
-    half* a,
-    half* b,
-    half* bias,
-    half* c_out,
-    int32_t M,
-    int32_t N,
-    int32_t K,
-    float alpha,
-    float beta) {
-    // Convert the `alpha` and `beta` weights into half precision
-    const half alpha_fp16{ __float2half(alpha) };
-    const half beta_fp16{ __float2half(beta) };
-
-    // Tile using a 2D grid
-    int32_t warpI = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
-    int32_t warpJ = blockIdx.y * blockDim.y + threadIdx.y;
-
-    // Define the fragments
-    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> a_frag;
-    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> b_frag;
-    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, half> bias_frag;
-    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, half> acc_frag;
-    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, half> c_frag;
-
-    wmma::fill_fragment(acc_frag, 0.0f);
-
-    const int32_t aRow{ WMMA_M * warpJ };
-    const int32_t bCol{ WMMA_N * warpI };
-
-    for (int32_t i{ 0 }; i < K; i += WMMA_K) {
-        const int32_t aCol{ i };
-        const int32_t bRow{ i };
-
-        // Bounds checking
-        if (aRow < M && bCol < N) {
-            // Fill the fragments noting the column-major memory format
-            wmma::load_matrix_sync(a_frag, a + aCol * M + aRow, M);
-            wmma::load_matrix_sync(b_frag, b + bCol * K + bRow, K);
-
-            // Perform the matrix multiplication
-            wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
-        }
-    }
-
-    // Load and add in the bias
-    wmma::load_matrix_sync(bias_frag, bias + bCol * M + aRow, M, wmma::mem_col_major);
-
-#pragma unroll
-    for (int32_t i{ 0 }; i < acc_frag.num_elements; i++) {
-        c_frag.x[i] = alpha_fp16 * acc_frag.x[i] + beta_fp16 * bias_frag.x[i];
-    }
-
-    // Store the resulting output
-    wmma::store_matrix_sync(c_out + bCol * M + aRow, c_frag, M, wmma::mem_col_major);
-}
 
 __global__ void convertFp32ToFp16(float* in, half* out, const int32_t len) {
     int32_t idx{ static_cast<int32_t>(blockIdx.x * blockDim.x + threadIdx.x) };
@@ -149,11 +82,16 @@ int32_t main() {
     std::unique_ptr<float[]> b_host{ new float[MATRIX_K * MATRIX_N * sizeof(float)] };
     std::unique_ptr<float[]> bias_host{ new float[MATRIX_M * MATRIX_N * sizeof(float)] };
     std::unique_ptr<float[]> c_host{ new float[MATRIX_M * MATRIX_N * sizeof(float)] };
-    std::unique_ptr<float[]> c_wmma_host{ new float[MATRIX_M * MATRIX_N * sizeof(float)] };
+    std::unique_ptr<float[]> c_cublas_host{ new float[MATRIX_M * MATRIX_N * sizeof(float)] };
 
     // Clear the contents of `c` matrices
     cudaMemset(c_fp16, __float2half(0.0f), MATRIX_M * MATRIX_N * sizeof(half));
     std::fill(c_host.get(), c_host.get() + MATRIX_M * MATRIX_N, 0.0f);
+
+    // Initialize the cuBLAS handle to use tensor cores
+    cublasHandle_t cublasHandle;
+    cublasCreate(&cublasHandle);
+    cublasSetMathMode(cublasHandle, CUBLAS_TENSOR_OP_MATH);
 
     // Create and initialize the CUDA random number generator
     curandGenerator_t randGen;
@@ -161,9 +99,9 @@ int32_t main() {
     curandSetPseudoRandomGeneratorSeed(randGen, 69);
 
     // Create and initialize the CUDA events
-    cudaEvent_t startWMMA, stopWMMA;
-    cudaEventCreate(&startWMMA);
-    cudaEventCreate(&stopWMMA);
+    cudaEvent_t startCublas, stopCublas;
+    cudaEventCreate(&startCublas);
+    cudaEventCreate(&stopCublas);
 
     // Create the timing variables for the reference CPU matrix multiply
     std::chrono::high_resolution_clock::time_point referenceStartTime, referenceEndTime;
@@ -220,30 +158,87 @@ int32_t main() {
               << "alpha = " << ALPHA << ", "
               << "beta = " << BETA << std::endl;
 
-    std::cout << "Running with WMMA" << std::endl;
+    std::cout << "Running with cuBLAS" << std::endl;
 
-    // Perform the WMMA matrix multiplication
+    // Perform the cuBLAS matrix multiplication
     {
-        dim3 blockDim{ 256, 4, 1 };
-        dim3 gridDim{
-            (MATRIX_N + (WMMA_N * blockDim.x / WARP_SIZE) - 1) / (WMMA_N * blockDim.x / WARP_SIZE),
-            (MATRIX_M + (WMMA_M * blockDim.y) - 1) / (WMMA_M * blockDim.y),
-            1 };
-
-        // Launch the WMMA matrix multiplication kernel
-        cudaEventRecord(startWMMA);
-        wmma_matmul<<<gridDim, blockDim>>>(
-            a_fp16,
-            b_fp16,
-            bias_fp16,
-            c_fp16,
+        // Warm up cuBLAS
+        cublasGemmEx(
+            cublasHandle,
+            CUBLAS_OP_N,
+            CUBLAS_OP_N,
             MATRIX_M,
             MATRIX_N,
             MATRIX_K,
-            ALPHA,
-            BETA);
-        cudaEventRecord(stopWMMA);
-        cudaEventSynchronize(stopWMMA);
+            &ALPHA,
+            a_fp16,
+            CUDA_R_16F,
+            MATRIX_M,
+            b_fp16,
+            CUDA_R_16F,
+            MATRIX_K,
+            &ALPHA,
+            c_fp16,
+            CUDA_R_16F,
+            MATRIX_M,
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+        cublasAxpyEx(
+            cublasHandle,
+            MATRIX_M * MATRIX_N,
+            &BETA,
+            CUDA_R_32F,
+            bias_fp16,
+            CUDA_R_16F,
+            1,
+            c_fp16,
+            CUDA_R_16F,
+            1,
+            CUDA_R_32F);
+
+        // Reset the contents of `c_fp16` matrices
+        cudaMemset(c_fp16, __float2half(0.0f), MATRIX_M * MATRIX_N * sizeof(half));
+
+        // Launch the cuBLAS matrix multiplication kernel
+        cudaEventRecord(startCublas);
+        cublasGemmEx(
+            cublasHandle,
+            CUBLAS_OP_N,
+            CUBLAS_OP_N,
+            MATRIX_M,
+            MATRIX_N,
+            MATRIX_K,
+            &ALPHA,
+            a_fp16,
+            CUDA_R_16F,
+            MATRIX_M,
+            b_fp16,
+            CUDA_R_16F,
+            MATRIX_K,
+            &BETA,
+            c_fp16,
+            CUDA_R_16F,
+            MATRIX_M,
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+        // Add the bias in to the result. Treat the `bias_fp16` and `c_fp16`
+        // as long vectors when adding them together
+        cublasAxpyEx(
+            cublasHandle,
+            MATRIX_M * MATRIX_N,
+            &BETA,
+            CUDA_R_32F,
+            bias_fp16,
+            CUDA_R_16F,
+            1,
+            c_fp16,
+            CUDA_R_16F,
+            1,
+            CUDA_R_32F);
+        cudaEventRecord(stopCublas);
+        cudaEventSynchronize(stopCublas);
 
         // Convert the `c_fp16` to `c_fp32`
         dim3 blockDimConvert{ 256, 1, 1 };
@@ -253,9 +248,9 @@ int32_t main() {
         // Launch the kernel to convert the `c_fp16`
         convertFp16ToFp32<<<gridDimConvert, blockDimConvert>>>(c_fp16, c_fp32, MATRIX_M * MATRIX_N);
 
-        // Copy the result to the `c_wmma_host`
+        // Copy the result to the `c_cublas_host`
         cudaMemcpy(
-            c_wmma_host.get(), c_fp32, MATRIX_M * MATRIX_N * sizeof(float), cudaMemcpyDeviceToHost);
+            c_cublas_host.get(), c_fp32, MATRIX_M * MATRIX_N * sizeof(float), cudaMemcpyDeviceToHost);
     }
 
     std::cout << "Running on CPU" << std::endl;
@@ -282,7 +277,7 @@ int32_t main() {
         int32_t errors = 0;
         for (int32_t i = 0; i < MATRIX_M * MATRIX_N; i++) {
             float v1 = c_host[i];
-            float v2 = c_wmma_host[i];
+            float v2 = c_cublas_host[i];
             float diff  = fabs(v1 - v2);
             float relative_err = diff / v2;
             float eps = 0.01;
@@ -295,25 +290,27 @@ int32_t main() {
         }
 
         if (errors > 0) {
-            std::cout << "WMMA does not agree with reference! " << errors << " errors!" << std::endl;
+            std::cout << "cuBLAS does not agree with reference! " << errors
+                      << " errors!" << std::endl;
         } else {
-            std::cout << "Results verified: reference and WMMA agree." << std::endl;
-            float wmmaTime;
-            cudaEventElapsedTime(&wmmaTime, startWMMA, stopWMMA);
+            std::cout << "Results verified: reference and cuBLAS agree." << std::endl;
+            float cublasTime;
+            cudaEventElapsedTime(&cublasTime, startCublas, stopCublas);
 
             std::chrono::milliseconds referenceDuration{
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     referenceEndTime - referenceStartTime) };
             std::cout << std::fixed << std::setprecision(4)
-                      << "wmma took " << wmmaTime << "ms\n"
+                      << "cuBLAS took " << cublasTime << "ms\n"
                       << "reference took " << referenceDuration.count() << "ms" << std::endl;
         }
     }
 
     // Clean up
     curandDestroyGenerator(randGen);
-    cudaEventDestroy(startWMMA);
-    cudaEventDestroy(stopWMMA);
+    cublasDestroy(cublasHandle);
+    cudaEventDestroy(startCublas);
+    cudaEventDestroy(stopCublas);
 
     // Free all of the allocated memory
     cudaFree(a_fp32);
