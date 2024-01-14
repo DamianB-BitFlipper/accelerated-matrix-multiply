@@ -27,7 +27,7 @@
 SM_ARCH ?= 75
 
 all: simpleTiledGEMM.cu
-	nvcc -o tiledGemm -arch=sm_$(SM_ARCH) -lcurand simpleTiledGEMM.cu
+	nvcc -o tiledGemm -arch=sm_$(SM_ARCH) -I../include -lcurand simpleTiledGEMM.cu
 
 clean:
 	rm -f tiledGemm
