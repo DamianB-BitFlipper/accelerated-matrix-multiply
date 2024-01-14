@@ -1,3 +1,3 @@
 # Accelerated Matrix Multiply
 
-Implements matrix multiply in a vareity of ways: tiled CUDA, profiled CUDA, cuBLAS and WMMA.
+Implements matrix multiply in a variety of ways: tiled CUDA, hyper-optimized CUDA, cuBLAS and WMMA.
