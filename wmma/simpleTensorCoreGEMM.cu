@@ -145,11 +145,11 @@ int32_t main(int argc, char *argv[]) {
     cudaMalloc(&bias_fp16, matrixM * matrixN * sizeof(half));
     cudaMalloc(&c_fp16, matrixM * matrixN * sizeof(half));
 
-    std::unique_ptr<float[]> a_host{ new float[matrixM * matrixK * sizeof(float)] };
-    std::unique_ptr<float[]> b_host{ new float[matrixK * matrixN * sizeof(float)] };
-    std::unique_ptr<float[]> bias_host{ new float[matrixM * matrixN * sizeof(float)] };
-    std::unique_ptr<float[]> c_host{ new float[matrixM * matrixN * sizeof(float)] };
-    std::unique_ptr<float[]> c_cuda_host{ new float[matrixM * matrixN * sizeof(float)] };
+    std::unique_ptr<float[]> a_host{ new float[matrixM * matrixK] };
+    std::unique_ptr<float[]> b_host{ new float[matrixK * matrixN] };
+    std::unique_ptr<float[]> bias_host{ new float[matrixM * matrixN] };
+    std::unique_ptr<float[]> c_host{ new float[matrixM * matrixN] };
+    std::unique_ptr<float[]> c_cuda_host{ new float[matrixM * matrixN] };
 
     // Clear the contents of `c` matrices
     cudaMemset(c_fp16, __float2half(0.0f), matrixM * matrixN * sizeof(half));

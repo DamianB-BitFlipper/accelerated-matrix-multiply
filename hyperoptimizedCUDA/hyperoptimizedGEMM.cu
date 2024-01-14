@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <memory>
 #include <algorithm>
+#include <random>
 #include <chrono>
 
 #include <curand.h>
@@ -100,7 +101,7 @@ int main(int argc, char **argv) {
     half* bias_fp16;
     half* c_fp16;
 
-    // Allocate the memory for the matrices
+    // Allocate the device memory for the matrices
     cudaMalloc(&a_fp32, matrixM * matrixK * sizeof(float));
     cudaMalloc(&b_fp32, matrixK * matrixN * sizeof(float));
     cudaMalloc(&bias_fp32, matrixM * matrixN * sizeof(float));
@@ -110,40 +111,57 @@ int main(int argc, char **argv) {
     cudaMalloc(&bias_fp16, matrixM * matrixN * sizeof(half));
     cudaMalloc(&c_fp16, matrixM * matrixN * sizeof(half));
 
-    std::unique_ptr<float[]> a_host{ new float[matrixM * matrixK * sizeof(float)] };
-    std::unique_ptr<float[]> b_host{ new float[matrixK * matrixN * sizeof(float)] };
-    std::unique_ptr<float[]> bias_host{ new float[matrixM * matrixN * sizeof(float)] };
-    std::unique_ptr<float[]> c_host{ new float[matrixM * matrixN * sizeof(float)] };
-    std::unique_ptr<float[]> c_cuda_host{ new float[matrixM * matrixN * sizeof(float)] };
+    float* a_host;
+    float* b_host;
+    float* bias_host;
+    float* c_host;
+    float* c_cuda_host;
+    cudaHostAlloc(&a_host, matrixM * matrixK * sizeof(float), 0);
+    cudaHostAlloc(&b_host, matrixK * matrixN * sizeof(float), 0);
+    cudaHostAlloc(&bias_host, matrixM * matrixN * sizeof(float), 0);
+    cudaHostAlloc(&c_host, matrixM * matrixN * sizeof(float), 0);
+    cudaHostAlloc(&c_cuda_host, matrixM * matrixN * sizeof(float), 0);
+
+    // Use std::generate to fill the host input arrays with random float values
+    std::mt19937 randGen{ std::random_device{}() };
+    std::uniform_real_distribution<float> dis(-420.0f, 420.0f);
+    std::generate(a_host, a_host + matrixM * matrixK, [&]() { return dis(randGen); });
+    std::generate(b_host, b_host + matrixK * matrixN, [&]() { return dis(randGen); });
+    std::generate(bias_host, bias_host + matrixN * matrixM, [&]() { return dis(randGen); });
 
     // Clear the contents of `c` matrices
     cudaMemset(c_fp16, __float2half(0.0f), matrixM * matrixN * sizeof(half));
-    std::fill(c_host.get(), c_host.get() + matrixM * matrixN, 0.0f);
-
-    // Create and initialize the CUDA random number generator
-    curandGenerator_t randGen;
-    curandCreateGenerator(&randGen, CURAND_RNG_PSEUDO_DEFAULT);
-    curandSetPseudoRandomGeneratorSeed(randGen, 69);
+    std::fill(c_host, c_host + matrixM * matrixN, 0.0f);
 
     // Create and initialize the CUDA events
     cudaEvent_t startCUDA, stopCUDA;
     cudaEventCreate(&startCUDA);
     cudaEventCreate(&stopCUDA);
 
-    // Fill the matrices with random values
-    fillMatricesRand(randGen,
-                     a_fp32, b_fp32, bias_fp32,
-                     a_fp16, b_fp16, bias_fp16,
-                     a_host, b_host, bias_host,
-                     matrixM, matrixN, matrixK);
+    std::cout << "Transfer to GPU" << std::endl;
 
-    // Copy the random constents of the device float matrices to the host matrices
+    // Copy the random constents of the host matrices to the device float matrices
+    //nvtxRangePush("host-to-device");
     cudaMemcpy(
-        a_host.get(), a_fp32, matrixM * matrixK * sizeof(float), cudaMemcpyDeviceToHost);
+        a_fp32, a_host, matrixM * matrixK * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(
-        b_host.get(), b_fp32, matrixK * matrixN * sizeof(float), cudaMemcpyDeviceToHost);
+        b_fp32, b_host, matrixK * matrixN * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(
-        bias_host.get(), bias_fp32, matrixM * matrixN * sizeof(float), cudaMemcpyDeviceToHost);
+        bias_fp32, bias_host, matrixM * matrixN * sizeof(float), cudaMemcpyHostToDevice);
+    //nvtxRangePop();
+
+    std::cout << "Converting to half" << std::endl;
+
+    // Convert the device float matrices to half matrices
+    //nvtxRangePush("float-to-half");
+    dim3 blockDimConvert{ 256, 1, 1 };
+    dim3 gridDimConvert{
+        (static_cast<uint32_t>(matrixM * matrixN + blockDimConvert.x - 1) / blockDimConvert.x),
+            1, 1 };
+    convertFp32ToFp16<<<gridDimConvert, blockDimConvert>>>(a_fp32, a_fp16, matrixM * matrixK);
+    convertFp32ToFp16<<<gridDimConvert, blockDimConvert>>>(b_fp32, b_fp16, matrixK * matrixN);
+    convertFp32ToFp16<<<gridDimConvert, blockDimConvert>>>(bias_fp32, bias_fp16, matrixM * matrixN);
+    //nvtxRangePop();
 
     // Some useful prints
     std::cout << "M = " << matrixM << ", "
@@ -162,11 +180,6 @@ int main(int argc, char **argv) {
     dim3 dimGridCompute{
         (matrixN + dimBlockCompute.x - 1) / dimBlockCompute.x,
             (matrixM + dimBlockCompute.y - 1) / dimBlockCompute.y };
-
-    dim3 blockDimConvert{ 256, 1, 1 };
-    dim3 gridDimConvert{
-        (static_cast<uint32_t>(matrixM * matrixN + blockDimConvert.x - 1) / blockDimConvert.x),
-            1, 1 };
 
     // Perform the kernel matrix multiplication `nWarmup + nIters` times
     // Check for correctness on the first time.
@@ -196,7 +209,7 @@ int main(int argc, char **argv) {
         if (check && i == 0) {
             // Copy the result to the `c_cuda_host`
             cudaMemcpy(
-                c_cuda_host.get(), c_fp32, matrixM * matrixN * sizeof(float), cudaMemcpyDeviceToHost);
+                c_cuda_host, c_fp32, matrixM * matrixN * sizeof(float), cudaMemcpyDeviceToHost);
         }
 
         // Record the runtime after the warmup runs
@@ -213,10 +226,10 @@ int main(int argc, char **argv) {
         std::cout << "Running on CPU" << std::endl;
         auto referenceStartTime{ std::chrono::high_resolution_clock::now() };
         referenceMatrixMultiply(
-            a_host.get(),
-            b_host.get(),
-            bias_host.get(),
-            c_host.get(),
+            a_host,
+            b_host,
+            bias_host,
+            c_host,
             matrixM,
             matrixN,
             matrixK,
@@ -251,7 +264,6 @@ int main(int argc, char **argv) {
               << gFlops << " GFlops" << std::endl;
 
     // Clean up
-    curandDestroyGenerator(randGen);
     cudaEventDestroy(startCUDA);
     cudaEventDestroy(stopCUDA);
 
@@ -264,6 +276,11 @@ int main(int argc, char **argv) {
     cudaFree(b_fp16);
     cudaFree(bias_fp16);
     cudaFree(c_fp16);
+    cudaFreeHost(a_host);
+    cudaFreeHost(b_host);
+    cudaFreeHost(bias_host);
+    cudaFreeHost(c_host);
+    cudaFreeHost(c_cuda_host);
 
     return 0;
 }

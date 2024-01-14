@@ -105,8 +105,8 @@ void fillMatricesRand(
 }
 
 int32_t compareMatrices(
-    std::unique_ptr<float[]>& c_host,
-    std::unique_ptr<float[]>& c_reference_host,
+    float* c_host,
+    float* c_cuda_host,
     const int32_t M,
     const int32_t N,
     const int32_t K
@@ -115,7 +115,7 @@ int32_t compareMatrices(
     int32_t errors = 0;
     for (int32_t i = 0; i < M * N; i++) {
         float v1 = c_host[i];
-        float v2 = c_reference_host[i];
+        float v2 = c_cuda_host[i];
         float diff  = fabs(v1 - v2);
         float relative_err = diff / v2;
         float eps = 0.01;
@@ -128,4 +128,17 @@ int32_t compareMatrices(
     }
 
     return errors;
+}
+
+/**
+ * A `unique_ptr` version of the function.
+ */
+int32_t compareMatrices(
+    std::unique_ptr<float[]>& c_host,
+    std::unique_ptr<float[]>& c_cuda_host,
+    const int32_t M,
+    const int32_t N,
+    const int32_t K
+    ) {
+    return compareMatrices(c_host.get(), c_cuda_host.get(), M, N, K);
 }
