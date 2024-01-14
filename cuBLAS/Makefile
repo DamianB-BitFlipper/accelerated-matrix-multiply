@@ -27,7 +27,7 @@
 SM_ARCH ?= 75
 
 all: simplecuBLASGEMM.cu
-	nvcc -o cuBLASGemm -arch=sm_$(SM_ARCH) -lcublas -lcurand simplecuBLASGEMM.cu
+	nvcc -o cuBLASGemm -arch=sm_$(SM_ARCH) -I../include -lcublas -lcurand simplecuBLASGEMM.cu
 
 clean:
 	rm -f cuBLASGemm

@@ -18,7 +18,7 @@ using namespace nvcuda;
 
 const int32_t WARP_SIZE{ 32 };
 
-// The only dimensions currently supported by WMMA
+// Dimensions currently supported by WMMA
 const int32_t WMMA_M{ 16 };
 const int32_t WMMA_N{ 16 };
 const int32_t WMMA_K{ 16 };
@@ -283,7 +283,6 @@ int32_t main(int argc, char *argv[]) {
     std::cout << std::fixed << std::setprecision(4)
               << "CUDA took " << (cudaElapsedTime / nIters) << "ms, "
               << gFlops << " GFlops" << std::endl;
-
 
     // Clean up
     curandDestroyGenerator(randGen);

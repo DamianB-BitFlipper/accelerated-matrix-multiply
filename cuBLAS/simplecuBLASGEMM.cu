@@ -7,57 +7,62 @@
 
 #include <curand.h>
 #include <cublas_v2.h>
+#include <cuda_fp16.h>
 
-const float ALPHA{ 2.0f };
-const float BETA{ 30.0f };
+// Local includes
+#include <argparse/argparse.hpp>
+#include <common.hpp>
 
-// Must be multiples of 16 for wmma code to work
-const int32_t MATRIX_M{ 1024 };
-const int32_t MATRIX_N{ 1024 };
-const int32_t MATRIX_K{ 1024 };
+// Dimensions currently supported by cuBLAS
+const int32_t CUBLAS_M{ 16 };
+const int32_t CUBLAS_N{ 16 };
+const int32_t CUBLAS_K{ 16 };
 
-__global__ void convertFp32ToFp16(float* in, half* out, const int32_t len) {
-    int32_t idx{ static_cast<int32_t>(blockIdx.x * blockDim.x + threadIdx.x) };
-    if (idx < len) {
-        out[idx] = static_cast<half>(in[idx]);
+int32_t main(int argc, char *argv[]) {
+    argparse::Parser parser;
+    // default matrix sizes:
+    // A: 1024 x 1024
+    // B: 1024 x 1024
+    // C: 1024 x 1024
+    int32_t matrixM{ 1024 };
+    int32_t matrixN{ 1024 };
+    int32_t matrixK{ 1024 };
+
+    float alpha{ 2.0f };
+    float beta{ 30.0f };
+    int32_t nIters{ 40 };
+    int32_t nWarmup{ 10 };
+    bool check{ false };
+    parser.add_positional(matrixM);
+    parser.add_positional(matrixN);
+    parser.add_positional(matrixK);
+    parser.add_option(alpha, "--alpha");
+    parser.add_option(beta, "--beta");
+    parser.add_option(nIters, "--iters");
+    parser.add_option(nWarmup, "--warmup");
+    parser.add_flag(check, "--check");
+
+    if (!parser.parse(argc, argv)) {
+        parser.help();
+        exit(EXIT_FAILURE);
     }
-}
 
-__global__ void convertFp16ToFp32(half* in, float* out, const int32_t len) {
-    int32_t idx{ static_cast<int32_t>(blockIdx.x * blockDim.x + threadIdx.x) };
-    if (idx < len) {
-        out[idx] = static_cast<float>(in[idx]);
+    // The matrix dimensions must be multiples of CUBLAS_M, CUBLAS_N, CUBLAS_K respectively to work
+    if (matrixM % CUBLAS_M != 0 ||
+        matrixN % CUBLAS_N != 0 ||
+        matrixK % CUBLAS_K != 0) {
+        std::cerr << "The matrix dimensions must be multiples of: ("
+                  << CUBLAS_M << ", " << CUBLAS_N << ", " << CUBLAS_K << ")"
+                  << std::endl;
+        exit(EXIT_FAILURE);
     }
-}
 
-void referenceMatrixMultiply(
-    float* a,
-    float* b,
-    float* bias,
-    float* c_out,
-    int32_t M,
-    int32_t N,
-    int32_t K,
-    float alpha,
-    float beta) {
-    // Note: All input/output matrices are in column-major memory order
-    for (int32_t aRow{ 0 }; aRow < M; aRow++) {
-        for (int32_t bCol{ 0 }; bCol < N; bCol++) {
-            // Compute the value at `aRow, bCol`
-            for (int32_t k{ 0 }; k < K; k++) {
-                c_out[aRow + bCol * M] += a[aRow + k * M] * b[k + bCol * K];
-            }
+    // Times 2 because of the multiplication and addition
+    const int64_t FLOP{ 2 *
+            static_cast<int64_t>(matrixM) *
+            static_cast<int64_t>(matrixN) *
+            static_cast<int64_t>(matrixK) };
 
-            // Scale the `a * b` result by `alpha`
-            c_out[aRow + bCol * M] *= alpha;
-
-            // Add in the `bias` scaled by `beta`
-            c_out[aRow + bCol * M] += beta * bias[aRow + bCol * M];
-        }
-    }
-}
-
-int32_t main() {
     float* a_fp32;
     float* b_fp32;
     float* bias_fp32;
@@ -69,24 +74,24 @@ int32_t main() {
     half* c_fp16;
 
     // Allocate the memory for the matrices
-    cudaMalloc(&a_fp32, MATRIX_M * MATRIX_K * sizeof(float));
-    cudaMalloc(&b_fp32, MATRIX_K * MATRIX_N * sizeof(float));
-    cudaMalloc(&bias_fp32, MATRIX_M * MATRIX_N * sizeof(float));
-    cudaMalloc(&c_fp32, MATRIX_M * MATRIX_N * sizeof(float));
-    cudaMalloc(&a_fp16, MATRIX_M * MATRIX_K * sizeof(half));
-    cudaMalloc(&b_fp16, MATRIX_K * MATRIX_N * sizeof(half));
-    cudaMalloc(&bias_fp16, MATRIX_M * MATRIX_N * sizeof(half));
-    cudaMalloc(&c_fp16, MATRIX_M * MATRIX_N * sizeof(half));
+    cudaMalloc(&a_fp32, matrixM * matrixK * sizeof(float));
+    cudaMalloc(&b_fp32, matrixK * matrixN * sizeof(float));
+    cudaMalloc(&bias_fp32, matrixM * matrixN * sizeof(float));
+    cudaMalloc(&c_fp32, matrixM * matrixN * sizeof(float));
+    cudaMalloc(&a_fp16, matrixM * matrixK * sizeof(half));
+    cudaMalloc(&b_fp16, matrixK * matrixN * sizeof(half));
+    cudaMalloc(&bias_fp16, matrixM * matrixN * sizeof(half));
+    cudaMalloc(&c_fp16, matrixM * matrixN * sizeof(half));
 
-    std::unique_ptr<float[]> a_host{ new float[MATRIX_M * MATRIX_K * sizeof(float)] };
-    std::unique_ptr<float[]> b_host{ new float[MATRIX_K * MATRIX_N * sizeof(float)] };
-    std::unique_ptr<float[]> bias_host{ new float[MATRIX_M * MATRIX_N * sizeof(float)] };
-    std::unique_ptr<float[]> c_host{ new float[MATRIX_M * MATRIX_N * sizeof(float)] };
-    std::unique_ptr<float[]> c_cublas_host{ new float[MATRIX_M * MATRIX_N * sizeof(float)] };
+    std::unique_ptr<float[]> a_host{ new float[matrixM * matrixK * sizeof(float)] };
+    std::unique_ptr<float[]> b_host{ new float[matrixK * matrixN * sizeof(float)] };
+    std::unique_ptr<float[]> bias_host{ new float[matrixM * matrixN * sizeof(float)] };
+    std::unique_ptr<float[]> c_host{ new float[matrixM * matrixN * sizeof(float)] };
+    std::unique_ptr<float[]> c_cuda_host{ new float[matrixM * matrixN * sizeof(float)] };
 
     // Clear the contents of `c` matrices
-    cudaMemset(c_fp16, __float2half(0.0f), MATRIX_M * MATRIX_N * sizeof(half));
-    std::fill(c_host.get(), c_host.get() + MATRIX_M * MATRIX_N, 0.0f);
+    cudaMemset(c_fp16, __float2half(0.0f), matrixM * matrixN * sizeof(half));
+    std::fill(c_host.get(), c_host.get() + matrixM * matrixN, 0.0f);
 
     // Initialize the cuBLAS handle to use tensor cores
     cublasHandle_t cublasHandle;
@@ -99,127 +104,66 @@ int32_t main() {
     curandSetPseudoRandomGeneratorSeed(randGen, 69);
 
     // Create and initialize the CUDA events
-    cudaEvent_t startCublas, stopCublas;
-    cudaEventCreate(&startCublas);
-    cudaEventCreate(&stopCublas);
+    cudaEvent_t startCUDA, stopCUDA;
+    cudaEventCreate(&startCUDA);
+    cudaEventCreate(&stopCUDA);
 
-    // Create the timing variables for the reference CPU matrix multiply
-    std::chrono::high_resolution_clock::time_point referenceStartTime, referenceEndTime;
-
-    // Curand does not support `half`, so generate random `float` and then convert to `half`
-    {
-        curandGenerateUniform(randGen, a_fp32, MATRIX_M * MATRIX_K);
-        curandGenerateUniform(randGen, b_fp32, MATRIX_K * MATRIX_N);
-        curandGenerateUniform(randGen, bias_fp32, MATRIX_M * MATRIX_N);
-
-        const int32_t BLOCK_SIZE{ 256 };
-        dim3 gridDimA{ (MATRIX_M * MATRIX_K + BLOCK_SIZE - 1) / BLOCK_SIZE, 1, 1 };
-        dim3 gridDimB{ (MATRIX_K * MATRIX_N + BLOCK_SIZE - 1) / BLOCK_SIZE, 1, 1 };
-        dim3 gridDimBias{ (MATRIX_M * MATRIX_N + BLOCK_SIZE - 1) / BLOCK_SIZE, 1, 1 };
-        dim3 blockDim{ BLOCK_SIZE, 1, 1 };
-
-        // Create and initialize the CUDA streams
-        cudaStream_t stream1, stream2, stream3;
-
-        cudaStreamCreate(&stream1);
-        cudaStreamCreate(&stream2);
-        cudaStreamCreate(&stream3);
-
-        // Launch both kernels to convert the `a_fp32` and `b_fp32`
-        convertFp32ToFp16<<<gridDimA, blockDim, 0, stream1>>>(a_fp32, a_fp16, MATRIX_M * MATRIX_K);
-        convertFp32ToFp16<<<gridDimB, blockDim, 0, stream2>>>(b_fp32, b_fp16, MATRIX_K * MATRIX_N);
-        convertFp32ToFp16<<<gridDimBias, blockDim, 0, stream3>>>(
-            bias_fp32, bias_fp16, MATRIX_M * MATRIX_N);
-
-        // Wait for both streams
-        cudaStreamSynchronize(stream1);
-        cudaStreamSynchronize(stream2);
-        cudaStreamSynchronize(stream3);
-
-        // Clean up
-        cudaStreamDestroy(stream1);
-        cudaStreamDestroy(stream2);
-        cudaStreamDestroy(stream3);
-    }
+    // Fill the matrices with random values
+    fillMatricesRand(randGen,
+                     a_fp32, b_fp32, bias_fp32,
+                     a_fp16, b_fp16, bias_fp16,
+                     a_host, b_host, bias_host,
+                     matrixM, matrixN, matrixK);
 
     // Copy the random constents of the device float matrices to the host matrices
     cudaMemcpy(
-        a_host.get(), a_fp32, MATRIX_M * MATRIX_K * sizeof(float), cudaMemcpyDeviceToHost);
+        a_host.get(), a_fp32, matrixM * matrixK * sizeof(float), cudaMemcpyDeviceToHost);
     cudaMemcpy(
-        b_host.get(), b_fp32, MATRIX_K * MATRIX_N * sizeof(float), cudaMemcpyDeviceToHost);
+        b_host.get(), b_fp32, matrixK * matrixN * sizeof(float), cudaMemcpyDeviceToHost);
     cudaMemcpy(
-        bias_host.get(), bias_fp32, MATRIX_M * MATRIX_N * sizeof(float), cudaMemcpyDeviceToHost);
+        bias_host.get(), bias_fp32, matrixM * matrixN * sizeof(float), cudaMemcpyDeviceToHost);
 
     // Some useful prints
-    std::cout << "M = " << MATRIX_M << ", "
-              << "N = " << MATRIX_N << ", "
-              << "K = " << MATRIX_K << ", "
+    std::cout << "M = " << matrixM << ", "
+              << "N = " << matrixN << ", "
+              << "K = " << matrixK << ", "
               << std::fixed << std::setprecision(2)
-              << "alpha = " << ALPHA << ", "
-              << "beta = " << BETA << std::endl;
+              << "alpha = " << alpha << ", "
+              << "beta = " << beta << std::endl;
 
     std::cout << "Running with cuBLAS" << std::endl;
 
-    // Perform the cuBLAS matrix multiplication
-    {
-        // Warm up cuBLAS
-        cublasGemmEx(
-            cublasHandle,
-            CUBLAS_OP_N,
-            CUBLAS_OP_N,
-            MATRIX_M,
-            MATRIX_N,
-            MATRIX_K,
-            &ALPHA,
-            a_fp16,
-            CUDA_R_16F,
-            MATRIX_M,
-            b_fp16,
-            CUDA_R_16F,
-            MATRIX_K,
-            &ALPHA,
-            c_fp16,
-            CUDA_R_16F,
-            MATRIX_M,
-            CUBLAS_COMPUTE_32F,
-            CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    float cudaElapsedTime{ 0.0f };
 
-        cublasAxpyEx(
-            cublasHandle,
-            MATRIX_M * MATRIX_N,
-            &BETA,
-            CUDA_R_32F,
-            bias_fp16,
-            CUDA_R_16F,
-            1,
-            c_fp16,
-            CUDA_R_16F,
-            1,
-            CUDA_R_32F);
+    // The kernel parameters
+    dim3 blockDimConvert{ 256, 1, 1 };
+    dim3 gridDimConvert{
+        (matrixM * matrixN + blockDimConvert.x - 1) / blockDimConvert.x, 1, 1 };
 
-        // Reset the contents of `c_fp16` matrices
-        cudaMemset(c_fp16, __float2half(0.0f), MATRIX_M * MATRIX_N * sizeof(half));
-
+    // Perform the cuBLAS matrix multiplication `nWarmup + nIters` times
+    // Check for correctness on the first time.
+    // Record the time after nWarmup runs complete.
+    for (int32_t i{ 0 }; i < nWarmup + nIters; i++) {
         // Launch the cuBLAS matrix multiplication kernel
-        cudaEventRecord(startCublas);
+        cudaEventRecord(startCUDA);
         cublasGemmEx(
             cublasHandle,
             CUBLAS_OP_N,
             CUBLAS_OP_N,
-            MATRIX_M,
-            MATRIX_N,
-            MATRIX_K,
-            &ALPHA,
+            matrixM,
+            matrixN,
+            matrixK,
+            &alpha,
             a_fp16,
             CUDA_R_16F,
-            MATRIX_M,
+            matrixM,
             b_fp16,
             CUDA_R_16F,
-            MATRIX_K,
-            &BETA,
+            matrixK,
+            &beta,
             c_fp16,
             CUDA_R_16F,
-            MATRIX_M,
+            matrixM,
             CUBLAS_COMPUTE_32F,
             CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 
@@ -227,8 +171,8 @@ int32_t main() {
         // as long vectors when adding them together
         cublasAxpyEx(
             cublasHandle,
-            MATRIX_M * MATRIX_N,
-            &BETA,
+            matrixM * matrixN,
+            &beta,
             CUDA_R_32F,
             bias_fp16,
             CUDA_R_16F,
@@ -237,80 +181,83 @@ int32_t main() {
             CUDA_R_16F,
             1,
             CUDA_R_32F);
-        cudaEventRecord(stopCublas);
-        cudaEventSynchronize(stopCublas);
+        cudaEventRecord(stopCUDA);
+        cudaEventSynchronize(stopCUDA);
 
         // Convert the `c_fp16` to `c_fp32`
         dim3 blockDimConvert{ 256, 1, 1 };
         dim3 gridDimConvert{
-            (MATRIX_M * MATRIX_N + blockDimConvert.x - 1) / blockDimConvert.x, 1, 1 };
+            (matrixM * matrixN + blockDimConvert.x - 1) / blockDimConvert.x, 1, 1 };
 
         // Launch the kernel to convert the `c_fp16`
-        convertFp16ToFp32<<<gridDimConvert, blockDimConvert>>>(c_fp16, c_fp32, MATRIX_M * MATRIX_N);
+        convertFp16ToFp32<<<gridDimConvert, blockDimConvert>>>(c_fp16, c_fp32, matrixM * matrixN);
 
-        // Copy the result to the `c_cublas_host`
-        cudaMemcpy(
-            c_cublas_host.get(), c_fp32, MATRIX_M * MATRIX_N * sizeof(float), cudaMemcpyDeviceToHost);
+        // Reset the contents of `c_fp16` matrices
+        cudaMemset(c_fp16, __float2half(0.0f), matrixM * matrixN * sizeof(half));
+
+        // Copy the result once for checking
+        if (check && i == 0) {
+            // Copy the result to the `c_cuda_host`
+            cudaMemcpy(
+                c_cuda_host.get(), c_fp32, matrixM * matrixN * sizeof(float), cudaMemcpyDeviceToHost);
+        }
+
+        // Record the runtime after the warmup runs
+        if (i >= nWarmup) {
+            float elapsed;
+            cudaEventElapsedTime(&elapsed, startCUDA, stopCUDA);
+
+            cudaElapsedTime += elapsed;
+        }
     }
 
-    std::cout << "Running on CPU" << std::endl;
-
-    // Perform the CPU matrix multiplication
-    {
-        referenceStartTime = std::chrono::high_resolution_clock::now();
+    // Perform the CPU matrix multiplication if `check` is enabled
+    if (check) {
+        std::cout << "Running on CPU" << std::endl;
+        auto referenceStartTime{ std::chrono::high_resolution_clock::now() };
         referenceMatrixMultiply(
             a_host.get(),
             b_host.get(),
             bias_host.get(),
             c_host.get(),
-            MATRIX_M,
-            MATRIX_N,
-            MATRIX_K,
-            ALPHA,
-            BETA);
-        referenceEndTime = std::chrono::high_resolution_clock::now();
-    }
+            matrixM,
+            matrixN,
+            matrixK,
+            alpha,
+            beta);
+        auto referenceEndTime{ std::chrono::high_resolution_clock::now() };
 
-    // Compare the matrix outputs
-    {
-        // Usa a 1% relative tolerance
-        int32_t errors = 0;
-        for (int32_t i = 0; i < MATRIX_M * MATRIX_N; i++) {
-            float v1 = c_host[i];
-            float v2 = c_cublas_host[i];
-            float diff  = fabs(v1 - v2);
-            float relative_err = diff / v2;
-            float eps = 0.01;
-            if (relative_err >= eps) {
-                errors++;
-                if (errors < 10) {
-                    std::cout << v1 << " " << v2 << std::endl;
-                }
-            }
-        }
+        // Compare the matrix outputs
+        int32_t errors{ compareMatrices(c_host, c_cuda_host, matrixM, matrixN, matrixK) };
 
         if (errors > 0) {
-            std::cout << "cuBLAS does not agree with reference! " << errors
+            std::cout << "Tiled CUDA does not agree with reference! " << errors
                       << " errors!" << std::endl;
         } else {
-            std::cout << "Results verified: reference and cuBLAS agree." << std::endl;
-            float cublasTime;
-            cudaEventElapsedTime(&cublasTime, startCublas, stopCublas);
-
-            std::chrono::milliseconds referenceDuration{
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    referenceEndTime - referenceStartTime) };
-            std::cout << std::fixed << std::setprecision(4)
-                      << "cuBLAS took " << cublasTime << "ms\n"
-                      << "reference took " << referenceDuration.count() << "ms" << std::endl;
+            std::cout << "Results verified: reference and Tiled CUDA agree." << std::endl;
         }
+
+        // Print the reference runtime
+        std::chrono::milliseconds referenceDuration{
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                referenceEndTime - referenceStartTime) };
+
+        const double gFlops{ (FLOP / (referenceDuration.count() / 1000)) / 1e9 };
+        std::cout << "Reference took " << referenceDuration.count() << "ms, "
+                  << gFlops << " GFlops" << std::endl;
     }
+
+    // Print the average CUDA runtime
+    const double gFlops{ (FLOP / ((cudaElapsedTime / nIters) / 1000)) / 1e9 };
+    std::cout << std::fixed << std::setprecision(4)
+              << "CUDA took " << (cudaElapsedTime / nIters) << "ms, "
+              << gFlops << " GFlops" << std::endl;
 
     // Clean up
     curandDestroyGenerator(randGen);
     cublasDestroy(cublasHandle);
-    cudaEventDestroy(startCublas);
-    cudaEventDestroy(stopCublas);
+    cudaEventDestroy(startCUDA);
+    cudaEventDestroy(stopCUDA);
 
     // Free all of the allocated memory
     cudaFree(a_fp32);
