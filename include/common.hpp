@@ -61,6 +61,7 @@ void fillMatricesRand(
     const int32_t M,
     const int32_t N,
     const int32_t K) {
+    // Curand does not support `half`, so generate random `float` and then convert to `half`
     curandGenerateUniform(randGen, a_fp32, M * K);
     curandGenerateUniform(randGen, b_fp32, K * N);
     curandGenerateUniform(randGen, bias_fp32, M * N);

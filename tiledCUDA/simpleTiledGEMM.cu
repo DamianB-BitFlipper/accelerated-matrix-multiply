@@ -117,7 +117,7 @@ int32_t main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
-    // Time 2 because of the multiplication and addition
+    // Times 2 because of the multiplication and addition
     const int64_t FLOP{ 2 *
             static_cast<int64_t>(matrixM) *
             static_cast<int64_t>(matrixN) *
@@ -147,7 +147,7 @@ int32_t main(int argc, char *argv[]) {
     std::unique_ptr<float[]> b_host{ new float[matrixK * matrixN * sizeof(float)] };
     std::unique_ptr<float[]> bias_host{ new float[matrixM * matrixN * sizeof(float)] };
     std::unique_ptr<float[]> c_host{ new float[matrixM * matrixN * sizeof(float)] };
-    std::unique_ptr<float[]> c_reference_host{ new float[matrixM * matrixN * sizeof(float)] };
+    std::unique_ptr<float[]> c_cuda_host{ new float[matrixM * matrixN * sizeof(float)] };
 
     // Clear the contents of `c` matrices
     cudaMemset(c_fp16, __float2half(0.0f), matrixM * matrixN * sizeof(half));
@@ -163,7 +163,7 @@ int32_t main(int argc, char *argv[]) {
     cudaEventCreate(&startCUDA);
     cudaEventCreate(&stopCUDA);
 
-    // Curand does not support `half`, so generate random `float` and then convert to `half`
+    // Fill the matrices with random values
     fillMatricesRand(randGen,
                      a_fp32, b_fp32, bias_fp32,
                      a_fp16, b_fp16, bias_fp16,
@@ -178,7 +178,7 @@ int32_t main(int argc, char *argv[]) {
               << "alpha = " << alpha << ", "
               << "beta = " << beta << std::endl;
 
-    std::cout << "Running with CUDA" << std::endl;
+    std::cout << "Running with Tiled CUDA" << std::endl;
 
     float cudaElapsedTime{ 0.0f };
 
@@ -219,9 +219,9 @@ int32_t main(int argc, char *argv[]) {
 
         // Copy the result once for checking
         if (check && i == 0) {
-            // Copy the result to the `c_reference_host`
+            // Copy the result to the `c_cuda_host`
             cudaMemcpy(
-                c_reference_host.get(), c_fp32, matrixM * matrixN * sizeof(float), cudaMemcpyDeviceToHost);
+                c_cuda_host.get(), c_fp32, matrixM * matrixN * sizeof(float), cudaMemcpyDeviceToHost);
         }
 
         // Record the runtime after the warmup runs
@@ -236,7 +236,7 @@ int32_t main(int argc, char *argv[]) {
     // Perform the CPU matrix multiplication if `check` is enabled
     if (check) {
         std::cout << "Running on CPU" << std::endl;
-        auto referenceStartTime = std::chrono::high_resolution_clock::now();
+        auto referenceStartTime{ std::chrono::high_resolution_clock::now() };
         referenceMatrixMultiply(
             a_host.get(),
             b_host.get(),
@@ -247,10 +247,10 @@ int32_t main(int argc, char *argv[]) {
             matrixK,
             alpha,
             beta);
-        auto referenceEndTime = std::chrono::high_resolution_clock::now();
+        auto referenceEndTime{ std::chrono::high_resolution_clock::now() };
 
         // Compare the matrix outputs
-        int32_t errors{ compareMatrices(c_host, c_reference_host, matrixM, matrixN, matrixK) };
+        int32_t errors{ compareMatrices(c_host, c_cuda_host, matrixM, matrixN, matrixK) };
 
         if (errors > 0) {
             std::cout << "Tiled CUDA does not agree with reference! " << errors
