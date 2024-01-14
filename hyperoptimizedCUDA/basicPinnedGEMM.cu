@@ -18,7 +18,7 @@
 
 /* NOTE: All matrices are in column major order
  */
-__global__ void hyperoptimizedMatrixMultiply(
+__global__ void basicPinnedMatrixMultiply(
     const half *a,
     const half *b,
     const half *bias,
@@ -188,7 +188,7 @@ int main(int argc, char **argv) {
         // Launch the kernel matrix multiplication kernel
         //nvtxRangePush("kernel");
         cudaEventRecord(startCUDA);
-        hyperoptimizedMatrixMultiply<<<dimGridCompute, dimBlockCompute>>>(
+        basicPinnedMatrixMultiply<<<dimGridCompute, dimBlockCompute>>>(
             a_fp16,
             b_fp16,
             bias_fp16,

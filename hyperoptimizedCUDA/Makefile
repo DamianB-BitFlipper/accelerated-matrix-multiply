@@ -24,10 +24,15 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-SM_ARCH ?= 75
+SM_ARCH := 75
 
-all: hyperoptimizedGEMM.cu
-	nvcc -o hyperoptimizedGemm -arch=sm_$(SM_ARCH) -I../include -lcurand -lineinfo hyperoptimizedGEMM.cu
+CU_FILES := $(wildcard *.cu)
+PROGS := $(patsubst %.cu,%,$(CU_FILES))
+
+all: $(PROGS)
+
+%: %.cu
+	nvcc -o $@ -arch=sm_$(SM_ARCH) -I../include -lcurand -lineinfo $<
 
 clean:
-	rm -f hyperoptimizedGemm
+	rm -f $(PROGS)
