@@ -20,16 +20,21 @@ __global__ void convertFp16ToFp32(half* in, float* out, const int32_t len) {
     }
 }
 
+template <bool bIsRowMajor=false>
 void referenceMatrixMultiply(
-    float* a,
-    float* b,
-    float* bias,
+    const float* a,
+    const float* b,
+    const float* bias,
     float* c_out,
-    int32_t M,
-    int32_t N,
-    int32_t K,
-    float alpha,
-    float beta) {
+    const int32_t M,
+    const int32_t N,
+    const int32_t K,
+    const float alpha,
+    const float beta) {
+#define A(_i, _j) a[(_i) + (_j)*M]
+#define B(_i, _j) (bIsRowMajor ? b[(_i)*N + (_j)] : b[(_i) + (_j)*K])
+#define BIAS(_i, _j) bias[(_i) + (_j)*M]
+#define C(_i, _j) c_out[(_i) + (_j)*M]
     // Note: All input/output matrices are in column-major memory order
     for (int32_t aRow{ 0 }; aRow < M; aRow++) {
         for (int32_t bCol{ 0 }; bCol < N; bCol++) {
@@ -45,6 +50,10 @@ void referenceMatrixMultiply(
             c_out[aRow + bCol * M] += beta * bias[aRow + bCol * M];
         }
     }
+#undef A
+#undef B
+#undef BIAS
+#undef C
 }
 
 void fillMatricesRand(

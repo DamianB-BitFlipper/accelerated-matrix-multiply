@@ -16,7 +16,8 @@
 #include <argparse/argparse.hpp>
 #include <common.hpp>
 
-/* NOTE: All matrices are in column major order
+/* NOTE: The matrices `a`, `bias` and `c` are in column major order.
+ * Matrix `b` is in row major order.
  */
 __global__ void basicPinnedMatrixMultiply(
     const half *a,
@@ -29,7 +30,7 @@ __global__ void basicPinnedMatrixMultiply(
     float alpha,
     float beta) {
 #define A(_i, _j) a[(_i) + (_j)*M]
-#define B(_i, _j) b[(_i) + (_j)*K]
+#define B(_i, _j) b[(_i)*N + (_j)]
 #define BIAS(_i, _j) bias[(_i) + (_j)*M]
 #define C(_i, _j) c_out[(_i) + (_j)*M]
 
@@ -224,7 +225,7 @@ int main(int argc, char **argv) {
     if (check) {
         std::cout << "Running on CPU" << std::endl;
         auto referenceStartTime{ std::chrono::high_resolution_clock::now() };
-        referenceMatrixMultiply(
+        referenceMatrixMultiply<true>(
             a_host,
             b_host,
             bias_host,
